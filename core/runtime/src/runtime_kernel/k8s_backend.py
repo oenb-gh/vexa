@@ -93,11 +93,13 @@ def pod_overrides(env: dict[str, str], *, container_name: str) -> Optional[dict]
     node_selector = _scheduling_json(env, NODE_SELECTOR_ENV, dict)
     if not volumes and not tolerations and not node_selector:
         return None
-    # ``kubectl run --overrides`` merges the containers LIST by replacement (json-merge, not
-    # strategic), so a containers entry here wipes the generated container — image, env, command —
-    # and the API server rejects the Pod (`spec.containers[0].image: Required value`), killing the
-    # spawn instantly. Emit ``containers`` ONLY when volumeMounts force it (the workspace-store
-    # seam); pod-level fields (tolerations/nodeSelector) merge fine without touching the list.
+    # The containers entry below is a PARTIAL container — name + volumeMounts, no image — so it is
+    # only valid under a strategic merge, which patches the list element whose ``name`` matches.
+    # ``kubectl run`` defaults to ``--override-type=merge`` (RFC 7386), which REPLACES the whole
+    # list and leaves an imageless container the API server rejects with
+    # ``spec.containers[0].image: Required value``. start() therefore passes
+    # ``--override-type=strategic`` whenever it passes ``--overrides``; the two belong together.
+    # Pod-level fields (tolerations/nodeSelector) merge correctly under either type.
     spec: dict = {}
     if volume_mounts:
         spec["containers"] = [{"name": container_name, "volumeMounts": volume_mounts}]
@@ -143,7 +145,13 @@ class K8sBackend:
         # untouched — scheduling shapes the Pod, it is not container config.
         overrides = pod_overrides({**env, **_runtime_scheduling_env()}, container_name=name)
         if overrides:
-            args += ["--overrides", json.dumps(overrides)]
+            # --override-type=strategic is REQUIRED, not an optimisation: pod_overrides emits a
+            # partial container ({name, volumeMounts}) for the workspace-store seam, and the default
+            # merge type replaces the containers list wholesale, dropping the generated image and
+            # command. The Pod is then rejected outright ("spec.containers[0].image: Required
+            # value"), so every agent-worker spawn on backend=k8s fails. Strategic merge patches by
+            # the list's `name` merge key, which is exactly the intent.
+            args += ["--overrides", json.dumps(overrides), "--override-type=strategic"]
         if runnable.command:
             args += ["--command", "--", *runnable.command]
         _kubectl(*args)
