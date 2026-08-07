@@ -1,0 +1,151 @@
+# Builds the Vexa images into OeNB's Harbor.
+#
+# THIS IS THE ONLY FILE OeNB ADDS TO THE VEXA TREE. Base-image redirection is done in podman's
+# registries.conf on the runner, NOT by editing Dockerfiles — every edited file is a rebase
+# conflict forever, and the point of the fork is to shrink our patch queue to zero, not to grow
+# it. Anything else on `main` should be a fix on its way upstream, one commit per issue, so that
+# `git format-patch upstream..main` is a PR-ready series.
+#
+# Two copies of this file exist and must stay identical: `.gitlab-ci.yml` here in the fork, and
+# `ci/vexa-fork.gitlab-ci.yml` in the vexa-k8s deployment repo, which is where it is reviewed
+# and where the rationale lives (docs/vexa-image-build-pipeline-plan.md,
+# docs/vexa-fork-reset-plan.md). Change it there first.
+#
+# Publishing policy comes from the shared template and is what we want as-is:
+#   feature branch / MR -> validate + build, no push
+#   default branch      -> push oenb-dev/<image>:<CI_COMMIT_SHA> and :latest
+#   git tag             -> push oenb-intern/<image>:<tag>
+# The SHA tag is the same for every image in one run, so the Helm chart's `global.imageTag`
+# keeps working — it just points at our commit instead of v0.12.18.
+#
+# Required CI/CD variables (group or project): HARBOR_USERNAME, HARBOR_PASSWORD (masked),
+# HARBOR_HOST=pharbor.w.oenb.co.at.  Optionally HTTP_PROXY / HTTPS_PROXY / NO_PROXY — podman
+# propagates these into the build, which is how apt/PyPI/npm reach the outside world.
+
+include:
+  - project: 'public-projects/gitlab_ci_templates'
+    ref: main
+    file: '/pipelines/multi-container.yml'
+    inputs:
+      containers:
+        # ── Phase 0/1 ────────────────────────────────────────────────────────────────────────
+        # Deliberately starting with ONE image. v012-runtime is the best probe available: it is
+        # small, and its build exercises apt-get, PyPI (`pip install uv`, `uv sync`) AND a raw
+        # `curl https://dl.k8s.io/.../kubectl` — so a single run answers every open question about
+        # build-time egress and CA trust. It is also the image that carries our --override-type
+        # fix, so proving it retires helm/hotfix-kubectl-shim.yaml.
+        - CONTAINER_IMAGE_NAME: v012-runtime
+          CONTAINER_DOCKERFILE_PATH: core/runtime/Dockerfile
+          CONTAINER_BUILD_CONTEXT: core/runtime
+
+        # ── Phase 2 — uncomment once Phase 0 is green ────────────────────────────────────────
+        # Contexts are NOT uniform and are not guessable: some Dockerfiles COPY from their own
+        # directory, others from the repo root. These values come from upstream's own generator
+        # (`node release/candidate-image-map.mjs emit-build-plan - HEAD`) — re-run it after every
+        # upstream sync rather than trusting this list.
+        #
+        # - CONTAINER_IMAGE_NAME: v012-admin-api
+        #   CONTAINER_DOCKERFILE_PATH: core/identity/services/admin-api/Dockerfile
+        #   CONTAINER_BUILD_CONTEXT: core/identity/services/admin-api
+        # - CONTAINER_IMAGE_NAME: v012-gateway
+        #   CONTAINER_DOCKERFILE_PATH: core/gateway/services/gateway/Dockerfile
+        #   CONTAINER_BUILD_CONTEXT: core/gateway/services/gateway
+        # - CONTAINER_IMAGE_NAME: v012-mcp
+        #   CONTAINER_DOCKERFILE_PATH: core/meetings/services/mcp/Dockerfile
+        #   CONTAINER_BUILD_CONTEXT: core/meetings/services/mcp
+        # - CONTAINER_IMAGE_NAME: v012-terminal
+        #   CONTAINER_DOCKERFILE_PATH: clients/terminal/Dockerfile
+        #   CONTAINER_BUILD_CONTEXT: clients/terminal
+        # - CONTAINER_IMAGE_NAME: v012-agent-api
+        #   CONTAINER_DOCKERFILE_PATH: core/agent/services/agent-api/Dockerfile
+        #   CONTAINER_BUILD_CONTEXT: .
+        # - CONTAINER_IMAGE_NAME: v012-agent-worker
+        #   CONTAINER_DOCKERFILE_PATH: core/agent/worker/Dockerfile
+        #   CONTAINER_BUILD_CONTEXT: .
+        # - CONTAINER_IMAGE_NAME: v012-meeting-api
+        #   CONTAINER_DOCKERFILE_PATH: core/meetings/services/meeting-api/Dockerfile
+        #   CONTAINER_BUILD_CONTEXT: .
+        #
+        # ── Phase 3 — vexa-bot and vexa-lite are NOT listed here, by design ──────────────────
+        # Both are FROM mcr.microsoft.com/playwright:v1.56.0-jammy and Harbor has no mcr-proxy
+        # (verified 2026-08-07: only dockerhub/ghcr/quay/registry.k8s/redhat/nvidia/... exist).
+        # They are blocked on a platform request. vexa-bot additionally cannot use this matrix at
+        # all — see the `build-bot` job stub at the bottom.
+
+# The shared template's `.image_podman` before_script installs the OeNB CAs and configures the
+# storage driver. Defining our own before_script would REPLACE it (standard GitLab merge
+# semantics — the template warns about exactly this), so compose with !reference instead.
+build:
+  before_script:
+    - !reference [.image_podman, before_script]
+    - |
+      set -e
+      # Docker Hub is unreachable from here (TLS handshake timeout to
+      # production.cloudfront.docker.com), so redirect it at the container-runtime level. This is
+      # why no Dockerfile needs editing: `FROM python:3.12-slim` resolves to
+      # docker.io/library/python:3.12-slim and podman rewrites the docker.io prefix.
+      mkdir -p /etc/containers
+      cat > /etc/containers/registries.conf <<'EOF'
+      unqualified-search-registries = ["docker.io"]
+
+      [[registry]]
+      prefix   = "docker.io"
+      location = "pharbor.w.oenb.co.at/dockerhub-proxy"
+
+      # Phase 3: uncomment once an mcr-proxy project exists (or point at a local mirror of the
+      # single Playwright base under oenb-base/).
+      # [[registry]]
+      # prefix   = "mcr.microsoft.com"
+      # location = "pharbor.w.oenb.co.at/mcr-proxy"
+      EOF
+      echo "--- registries.conf ---"; cat /etc/containers/registries.conf
+      # Fail loudly and early if the redirect does not resolve, rather than 40 minutes into a
+      # build: this one pull is the whole Phase 0 hypothesis.
+      podman pull python:3.12-slim
+      echo "base image resolves through the mirror"
+
+# Experiment branches. The template publishes only from the default branch and tags, which is
+# right for `main` but makes the fork useless for trying an image change. An `exp/*` branch
+# therefore BUILDS automatically (fast feedback, catches a broken Dockerfile in minutes) and
+# PUBLISHES only when someone presses play — cheap, deliberate, and it never touches `latest`
+# because the template restricts that to the default branch.
+#
+# Result: oenb-dev/<image>:<CI_COMMIT_SHA>, pinnable from vexa-k8s the same way as a main build.
+deploy:
+  rules:
+    - if: '$CI_COMMIT_TAG'                            # → oenb-intern/<image>:<tag>
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'   # → oenb-dev/<image>:<sha> + :latest
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH =~ /^exp\//'             # → oenb-dev/<image>:<sha>, on demand
+      when: manual
+      allow_failure: true                             # a skipped manual job must not fail the pipeline
+    - when: never
+
+# ── Phase 3 stub — do not enable until mcr-proxy exists ─────────────────────────────────────
+# vexa-bot cannot go in the matrix above for two independent reasons:
+#   1. It builds FROM vexa/meet-join-env:dev, a base built locally from
+#      core/meetings/modules/join/Dockerfile.env. A parallel matrix has no ordering, and podman
+#      layer storage is not shared between GitLab jobs — so base and bot must build in ONE job.
+#   2. Upstream's own workflow notes the bot needs ~10 GB of layers. Pushing that through the
+#      template's `podman save` -> artifact -> `podman load` hand-off is not viable, so this job
+#      builds and pushes directly.
+# Also override STORAGE_DRIVER: multi-container.yml sets vfs globally, which copies every layer
+# instead of overlaying — wrong choice at this size when /dev/fuse is available.
+#
+# build-bot:
+#   stage: build
+#   extends: .image_podman
+#   variables:
+#     STORAGE_DRIVER: overlay
+#   rules:
+#     - if: '$CI_COMMIT_TAG'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - when: never
+#   script:
+#     - podman build -f core/meetings/modules/join/Dockerfile.env -t vexa/meet-join-env:dev
+#                    core/meetings/modules/join
+#     - podman build -f core/meetings/services/bot/Dockerfile
+#                    -t "pharbor.w.oenb.co.at/oenb-dev/vexa-bot:${CI_COMMIT_SHA}" .
+#     - podman login pharbor.w.oenb.co.at -u "$HARBOR_USERNAME" --password "$HARBOR_PASSWORD"
+#     - podman push "pharbor.w.oenb.co.at/oenb-dev/vexa-bot:${CI_COMMIT_SHA}"
