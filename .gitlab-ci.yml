@@ -72,6 +72,19 @@ include:
         # They are blocked on a platform request. vexa-bot additionally cannot use this matrix at
         # all — see the `build-bot` job stub at the bottom.
 
+# The template's `validate` job hadolints EVERY Dockerfile in the repo — all eleven, not just the
+# ones we build — and hadolint's default failure threshold is `info`, so the pipeline dies on
+# upstream's style warnings (unpinned apt versions, consecutive RUNs). Measured on the first run:
+# nine files flagged, zero of them errors, build never started.
+#
+# The wrong fix is editing those Dockerfiles: they are upstream's, every edit is a rebase conflict
+# forever, and "pin your apt versions" is not a patch Vexa would take. Raise the threshold instead
+# — errors (bad syntax, a malformed FROM) still fail the job, which is the breakage we actually
+# want caught when we edit a Dockerfile ourselves.
+validate:
+  variables:
+    HADOLINT_FAILURE_THRESHOLD: error
+
 # The shared template's `.image_podman` before_script installs the OeNB CAs and configures the
 # storage driver. Defining our own before_script would REPLACE it (standard GitLab merge
 # semantics — the template warns about exactly this), so compose with !reference instead.
