@@ -67,10 +67,13 @@ include:
         #   CONTAINER_BUILD_CONTEXT: .
         #
         # ── Phase 3 — vexa-bot and vexa-lite are NOT listed here, by design ──────────────────
-        # Both are FROM mcr.microsoft.com/playwright:v1.56.0-jammy and Harbor has no mcr-proxy
-        # (verified 2026-08-07: only dockerhub/ghcr/quay/registry.k8s/redhat/nvidia/... exist).
-        # They are blocked on a platform request. vexa-bot additionally cannot use this matrix at
-        # all — see the `build-bot` job stub at the bottom.
+        # Both are FROM mcr.microsoft.com/playwright:v1.56.0-jammy. That base is reachable since
+        # mcr-proxy was created (2026-08-11) and the registries.conf below redirects to it, so
+        # the old blocker is gone — but neither image fits this matrix:
+        #   vexa-bot   needs its own base built first, in the same job — see `build-bot` below.
+        #   vexa-lite  is a single ~10 GB Dockerfile with the same podman save/load problem;
+        #              give it its own job modelled on build-bot when it is actually wanted.
+        #              Nothing on entw runs lite any more, so it stays unbuilt for now.
 
 # The template's `validate` job hadolints EVERY Dockerfile in the repo — all eleven, not just the
 # ones we build — and hadolint's default failure threshold is `info`, so the pipeline dies on
@@ -105,15 +108,22 @@ build:
       prefix   = "docker.io"
       location = "pharbor.w.oenb.co.at/dockerhub-proxy"
 
-      # Phase 3: uncomment once an mcr-proxy project exists (or point at a local mirror of the
-      # single Playwright base under oenb-base/).
-      # [[registry]]
-      # prefix   = "mcr.microsoft.com"
-      # location = "pharbor.w.oenb.co.at/mcr-proxy"
+      # Microsoft Container Registry — the Playwright base that vexa-bot and vexa-lite build on.
+      # The mcr-proxy project was created on 2026-08-11 (Harbor project id 109); verified that
+      # pharbor.w.oenb.co.at/mcr-proxy/playwright:v1.56.0-jammy resolves through it. Same
+      # mechanism as docker.io above, so again no Dockerfile is edited: podman rewrites the
+      # mcr.microsoft.com prefix and `FROM mcr.microsoft.com/playwright:v1.56.0-jammy` lands on
+      # the mirror. This is what unblocks the build-bot job at the bottom.
+      [[registry]]
+      prefix   = "mcr.microsoft.com"
+      location = "pharbor.w.oenb.co.at/mcr-proxy"
       EOF
       echo "--- registries.conf ---"; cat /etc/containers/registries.conf
       # Fail loudly and early if the redirect does not resolve, rather than 40 minutes into a
-      # build: this one pull is the whole Phase 0 hypothesis.
+      # build: this one pull is the whole Phase 0 hypothesis. Only docker.io is asserted here —
+      # every image in the matrix builds on it, and none of them touch MCR. The Playwright base
+      # is asserted in build-bot instead, the one job that actually needs it, so the matrix does
+      # not pay for a 1.5 GB pull it will never use.
       podman pull python:3.12-slim
       echo "base image resolves through the mirror"
 
@@ -135,8 +145,11 @@ deploy:
       allow_failure: true                             # a skipped manual job must not fail the pipeline
     - when: never
 
-# ── Phase 3 stub — do not enable until mcr-proxy exists ─────────────────────────────────────
-# vexa-bot cannot go in the matrix above for two independent reasons:
+# ── Phase 3 — vexa-bot ───────────────────────────────────────────────────────────────────────
+# Unblocked on 2026-08-11: mcr-proxy now exists, so the Playwright base resolves through the
+# registries.conf redirect above and no Dockerfile needs editing.
+#
+# vexa-bot still cannot go in the matrix above, for two reasons that have nothing to do with MCR:
 #   1. It builds FROM vexa/meet-join-env:dev, a base built locally from
 #      core/meetings/modules/join/Dockerfile.env. A parallel matrix has no ordering, and podman
 #      layer storage is not shared between GitLab jobs — so base and bot must build in ONE job.
@@ -146,19 +159,47 @@ deploy:
 # Also override STORAGE_DRIVER: multi-container.yml sets vfs globally, which copies every layer
 # instead of overlaying — wrong choice at this size when /dev/fuse is available.
 #
-# build-bot:
-#   stage: build
-#   extends: .image_podman
-#   variables:
-#     STORAGE_DRIVER: overlay
-#   rules:
-#     - if: '$CI_COMMIT_TAG'
-#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-#     - when: never
-#   script:
-#     - podman build -f core/meetings/modules/join/Dockerfile.env -t vexa/meet-join-env:dev
-#                    core/meetings/modules/join
-#     - podman build -f core/meetings/services/bot/Dockerfile
-#                    -t "pharbor.w.oenb.co.at/oenb-dev/vexa-bot:${CI_COMMIT_SHA}" .
-#     - podman login pharbor.w.oenb.co.at -u "$HARBOR_USERNAME" --password "$HARBOR_PASSWORD"
-#     - podman push "pharbor.w.oenb.co.at/oenb-dev/vexa-bot:${CI_COMMIT_SHA}"
+# MANUAL on the default branch on purpose. This is a ~10 GB build that has never run here, and
+# making it automatic would attach it to every push to `main` before anyone has seen it succeed
+# once. Flip the `when: manual` to `when: on_success` after the first green run.
+build-bot:
+  stage: build
+  extends: .image_podman
+  variables:
+    STORAGE_DRIVER: overlay
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true      # a skipped manual job must not fail the pipeline
+    - when: never
+  before_script:
+    - !reference [.image_podman, before_script]
+    - |
+      set -e
+      mkdir -p /etc/containers
+      cat > /etc/containers/registries.conf <<'EOF'
+      unqualified-search-registries = ["docker.io"]
+
+      [[registry]]
+      prefix   = "docker.io"
+      location = "pharbor.w.oenb.co.at/dockerhub-proxy"
+
+      [[registry]]
+      prefix   = "mcr.microsoft.com"
+      location = "pharbor.w.oenb.co.at/mcr-proxy"
+      EOF
+      echo "--- registries.conf ---"; cat /etc/containers/registries.conf
+      # The Playwright base is asserted HERE rather than in the matrix `build` job, because this
+      # is the only job that needs it. Failing on the pull gives a one-line error; failing inside
+      # a 10 GB build gives a haystack.
+      podman pull mcr.microsoft.com/playwright:v1.56.0-jammy
+      echo "Playwright base resolves through mcr-proxy"
+  script:
+    - podman build -f core/meetings/modules/join/Dockerfile.env -t vexa/meet-join-env:dev
+                   core/meetings/modules/join
+    - podman build -f core/meetings/services/bot/Dockerfile
+                   -t "pharbor.w.oenb.co.at/oenb-dev/vexa-bot:${CI_COMMIT_SHA}" .
+    - podman login pharbor.w.oenb.co.at -u "$HARBOR_USERNAME" --password "$HARBOR_PASSWORD"
+    - podman push "pharbor.w.oenb.co.at/oenb-dev/vexa-bot:${CI_COMMIT_SHA}"
