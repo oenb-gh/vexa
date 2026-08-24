@@ -554,6 +554,10 @@ async def transcribe_audio(
         # Return format expected by Vexa RemoteTranscriber
         response = {
             "text": full_text,
+            # Echoed, not derived: the endpoint has always accepted `task` and dropped it, so a
+            # client that reads response["task"] (the OpenAI verbose_json shape has it, and the
+            # in-house wrapper this unit replaces returned it) got a KeyError.
+            "task": task,
             "language": detected_language,
             "language_probability": detected_language_probability,
             "duration": duration,
