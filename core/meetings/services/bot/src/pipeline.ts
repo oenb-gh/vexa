@@ -237,6 +237,22 @@ function createMixedBotPipeline(
   };
 }
 
+/** Deployment-wide fallback for the spoken language, used when a spawn does not name one.
+ *
+ *  Unset, Whisper auto-detects per WINDOW, and a window is one turn — a second or two. That is
+ *  far too little evidence: a German meeting measured de x20, en x2, sv x1 across 23 segments,
+ *  and the two English windows were not merely mislabelled but re-decoded as English, turning
+ *  "Behörde PGSA (Persian Gulf Strait Authority) auf der Online-Plattform X am Montag mit" into
+ *  "who are the big ears are Persian Gulf Stream. of straight authority of the online platform
+ *  XMO." A window holding an English proper noun is enough to flip the detector.
+ *
+ *  A per-spawn `language` still wins; this only removes the need to repeat it on every request
+ *  for a deployment that knows what language its meetings are in. */
+function defaultLanguage(): string | undefined {
+  const v = (typeof process !== 'undefined' && process.env?.VEXA_STT_LANGUAGE) || '';
+  return v.trim() || undefined;
+}
+
 /** Build the real STT transcribe closure from invocation.v1 — language baked into the call so
  *  the lane never knows about config. transcribeEnabled=false ⇒ a no-op transcribe (the engine
  *  still runs turn gating but emits empty text; recording-only meetings need no STT). */
@@ -249,7 +265,7 @@ export function createTranscribe(inv: Invocation): Transcribe {
     apiToken: inv.transcriptionServiceToken,
     model: inv.transcriptionModel ?? undefined,
   });
-  const language = inv.language ?? undefined;
+  const language = inv.language ?? defaultLanguage();
   return (pcm, prompt) => client.transcribe(pcm, language, prompt);
 }
 
@@ -273,7 +289,7 @@ export function createBotPipeline(
   if (isMixedLanePlatform(inv.platform)) {
     return createMixedBotPipeline(
       transcribe, sink, hintKindForPlatform(inv.platform),
-      inv.language ?? undefined, opts.onError, opts.createMixedTranscriber,
+      inv.language ?? defaultLanguage(), opts.onError, opts.createMixedTranscriber,
     );
   }
   return createGmeetBotPipeline(transcribe, sink, opts.config, opts.onError);
