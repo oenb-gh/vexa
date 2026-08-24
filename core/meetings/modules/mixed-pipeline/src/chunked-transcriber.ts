@@ -624,9 +624,17 @@ export class ChunkedTranscriber {
     const name = this.resolveName(turn);
     if (turn.pendingName && turn.pendingName !== name) this.cb.clearPending(turn.pendingName);
 
+    // ABSOLUTE index within the turn, not the tail's own position — `turn.seq` is how many
+    // segments of this turn have already confirmed, so `seq + confirmCount + i` is the slot this
+    // segment will occupy once it confirms. A `p${i}` id is positional within the CURRENT tail,
+    // so a segment changes id the moment it confirms, and the draft row it was published under
+    // survives beside the confirmed one (the egress retracts nothing: clearPending is a no-op,
+    // documented as "drafts self-replace by id"). Sharing one id from draft through confirmation
+    // makes that replace-by-id actually happen. No collision: `seq` only advances on confirm, so
+    // no two live segments of a turn ever claim the same slot.
     const tail: ChunkSegment[] = mapped.slice(confirmCount).map((s, i) => ({
       text: s.text, startMs: s.startMs, endMs: s.endMs, language: s.language,
-      segmentId: `turn:${turn.turnId}:p${i}`,
+      segmentId: `turn:${turn.turnId}:${turn.seq + confirmCount + i}`,
     }));
 
     if (confirmCount > 0) {
