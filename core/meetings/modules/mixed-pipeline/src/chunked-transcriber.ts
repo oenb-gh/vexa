@@ -675,7 +675,12 @@ export class ChunkedTranscriber {
     if (turn.seq === 0 && turn.allConfirmed.length === 0 && turn.pendingTail.length > 0) {
       // Closing pass produced nothing but drafts existed — never lose a turn.
       const name = this.resolveName(turn);
-      const promoted = turn.pendingTail.map((s, i) => ({ ...s, segmentId: `turn:${turn.turnId}:${i}` }));
+      // KEEP each draft's segmentId. The consumer's pending story is replace-by-id (the bot's
+      // transcript.v1 egress implements clearPending as a no-op precisely because "drafts
+      // self-replace by id"), so renumbering `:p0` to `:0` here publishes the promoted text
+      // under a NEW id and the draft row survives next to it. Every utterance then renders
+      // twice — the draft's earlier, shorter reading followed by the promoted one.
+      const promoted = turn.pendingTail.map((s) => ({ ...s }));
       this.cb.publish(name, promoted, []);
       this.rememberPublishedSpeaker(name, promoted[promoted.length - 1]?.endMs);
       turn.allConfirmed.push(...promoted);
