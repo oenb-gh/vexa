@@ -108,28 +108,43 @@ function despeckle(arr: number[], minRun: number): number[] {
   return out;
 }
 
-/** Longest SILENCE run treated as a pause INSIDE one utterance rather than the end
- *  of a turn. Above natural breath/phrase pauses in continuous speech, below a real
- *  end-of-utterance gap. Env-tunable because the right value is speaking-style and
- *  language dependent, and this ships as a hotfix mount where a rebuild is expensive. */
-const PAUSE_BRIDGE_MS = Number((typeof process !== 'undefined' && process.env?.VEXA_PAUSE_BRIDGE_MS) || 600);
-const PAUSE_BRIDGE_FRAMES = Math.max(0, Math.round(PAUSE_BRIDGE_MS / MS_PER_FRAME));
+/** Longest run treated as an interruption INSIDE one speaker's utterance rather than a
+ *  turn boundary. Above natural breath/phrase pauses and pyannote's own class flicker,
+ *  below a real end-of-utterance gap or handoff. Env-tunable because the right value is
+ *  speaking-style and language dependent, and this ships as a hotfix mount where a
+ *  rebuild is expensive. */
+const RUN_BRIDGE_MS = Number((typeof process !== 'undefined' && process.env?.VEXA_PAUSE_BRIDGE_MS) || 600);
+const RUN_BRIDGE_FRAMES = Math.max(0, Math.round(RUN_BRIDGE_MS / MS_PER_FRAME));
 
-/** Bridge a short silence run that sits between two runs of the SAME speaker class:
- *  that is one person breathing mid-sentence, not a turn boundary. Without this, a
- *  ~200ms pause fires speaker->silence + silence->speaker, and because the transcriber
- *  opens a turn only ON silence->speaker, the audio between the two is never submitted
- *  at all — measured at 32% of a 61s German monologue, with the lost words mapping
- *  exactly onto the gaps. It also shatters Whisper's window: every submission came out
- *  0.5-2.0s, far too short for German compound morphology ("Emissionshandel" split
- *  across two windows into "Emissionsmarkt" + "Emissionshandel").
+/** Bridge a short run that sits between two runs of the SAME non-silence class. Both
+ *  shapes it covers are one person continuing to speak, not a turn boundary:
  *
- *  Deliberately ASYMMETRIC, unlike despeckle: only a silence run BRACKETED BY THE SAME
- *  speaker is filled. A short SPEECH run between silences ("Ja.") is left alone, so a
- *  brief real utterance is never swallowed — this removes false-positive cuts without
- *  adding false negatives. Different classes either side (A -> silence -> B) is a real
- *  handoff and stays a cut. */
-function bridgePauses(arr: number[], maxRunFrames: number): number[] {
+ *    A -> silence(short) -> A   a breath or phrase pause mid-sentence
+ *    A -> B(short) -> A         pyannote relabelling a single voice for a moment, or a
+ *                               spurious {A,B} overlap flicker
+ *
+ *  Either one hard-splits the turn, and the transcriber then hands Whisper the fragment.
+ *  Measured on one person reading a German news article aloud: 28 turns in 41s, published
+ *  segments 0.5-2.2s, and because the cut lands mid-word Whisper decodes the two halves as
+ *  two whole words - "Iran warnt USA." / "USA und droht", "unter Druck setzen." / "setzen.
+ *  Waehrenddessen", "fuer die" / "fuer die Strasse". The reading was continuous, so only 4
+ *  of those 28 cuts were silence; the rest were speaker->speaker or overlap flicker, which
+ *  is why bridging silence alone barely moved the turn rate.
+ *
+ *  Deliberately ASYMMETRIC, unlike despeckle, which fills any short run from whatever
+ *  preceded it. Here the run must be bracketed by the SAME class and that class must not
+ *  be silence, so:
+ *    - silence -> A(short) -> silence   a brief real utterance ("Ja.") is NEVER swallowed
+ *    - A -> B(short) -> C               ambiguous, left alone
+ *    - A -> B(long) -> ...              a real handoff, left alone
+ *  i.e. false-positive cuts are removed without adding false negatives.
+ *
+ *  What it does cost: a sub-threshold interjection by another speaker is absorbed into the
+ *  surrounding speaker's turn. The words are still transcribed - they are inside that
+ *  turn's window - but attributed to the wrong speaker, and a short overlap stops being
+ *  reported to the diarizer. That is the right trade while segmentation is the binding
+ *  constraint on legibility; lower VEXA_PAUSE_BRIDGE_MS to buy attribution back. */
+function bridgeShortRuns(arr: number[], maxRunFrames: number): number[] {
   if (maxRunFrames <= 0) return arr;
   const out = arr.slice();
   const runs: Array<{ from: number; to: number; cls: number }> = [];
@@ -141,7 +156,6 @@ function bridgePauses(arr: number[], maxRunFrames: number): number[] {
   }
   for (let r = 1; r < runs.length - 1; r++) {
     const run = runs[r];
-    if (run.cls !== SILENCE_CLASS) continue;
     if (run.to - run.from > maxRunFrames) continue;
     const before = runs[r - 1].cls;
     if (before === SILENCE_CLASS || before !== runs[r + 1].cls) continue;
@@ -317,11 +331,11 @@ export class PyannoteSegmenter {
       frameClasses[f] = best;
       frameConfidence[f] = 1 / sumExp;
     }
-    // despeckle first (kill argmax wobbles), THEN bridge phrase pauses: bridging works
+    // despeckle first (kill argmax wobbles), THEN bridge short runs: bridging works
     // on settled runs, so it must not see single-frame noise as a run boundary.
-    const smoothed = bridgePauses(
+    const smoothed = bridgeShortRuns(
       despeckle(medianFilter3(frameClasses), MIN_RUN_FRAMES),
-      PAUSE_BRIDGE_FRAMES,
+      RUN_BRIDGE_FRAMES,
     );
     const frameMs = (window.length / SAMPLE_RATE) * 1000 / numFrames; // ≈13.04
     // pack-msteams-diarization-cutover (#394): scan the ENTIRE window
@@ -374,10 +388,10 @@ export class PyannoteSegmenter {
       // the close now would be unrecoverable — once bridged there is no silence->speaker
       // left to reopen the turn — so defer and let the next full-window scan rule on it.
       // Nothing is emitted here, so the dedup floors cannot suppress the retry.
-      if (kind === 'speaker→silence' && PAUSE_BRIDGE_FRAMES > 0) {
+      if (kind === 'speaker→silence' && RUN_BRIDGE_FRAMES > 0) {
         let end = f;
         while (end < scanEnd && smoothed[end] === SILENCE_CLASS) end++;
-        if (end >= scanEnd && end - f <= PAUSE_BRIDGE_FRAMES) continue;
+        if (end >= scanEnd && end - f <= RUN_BRIDGE_FRAMES) continue;
       }
       const ev: BoundaryEvent = { tMs, kind, confidence: frameConfidence[f] };
       // DEBUG (oversegmentation): show speaker→speaker cuts with the smoothed-class
