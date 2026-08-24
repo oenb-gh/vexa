@@ -40,3 +40,16 @@ def test_lists_the_one_model_it_serves(client, monkeypatch):
     assert body["object"] == "list"
     assert [m["id"] for m in body["data"]] == ["large-v3-turbo"]
     assert body["data"][0]["owned_by"] == "faster-whisper"
+
+
+def test_transcribe_accepts_a_request_without_the_model_field(client, monkeypatch):
+    """`model` is ignored (MODEL_SIZE decides), so omitting it must not be a 400.
+
+    422 here is FastAPI rejecting the absent *file* — i.e. validation got past `model`.
+    """
+    import transcription.main as svc
+
+    monkeypatch.setattr(svc, "API_TOKEN", "")
+    r = client.post("/v1/audio/transcriptions")
+    assert r.status_code == 422
+    assert "model" not in r.text.lower() or "file" in r.text.lower()
