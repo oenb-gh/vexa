@@ -489,7 +489,32 @@ export class ChunkedTranscriber {
       // Liveness: an item enqueued during the pump's closing pass misses the
       // drain loop; with no further boundaries nothing would re-pump it.
       if (t.queue.length > 0) { void t.pump(); return; }
-      if (!t.turn) return;
+      // WATCHDOG: audio is arriving but no turn is open. Every branch below is guarded on
+      // t.turn, and on the pyannote spine the ONLY thing that opens one is a silence->speaker
+      // boundary — so a single missed reopen silences the meeting permanently, with no error
+      // and audio still flowing. Measured: a meeting made 6 STT calls in 67s of continuous
+      // speech and then went quiet for the remaining 50s.
+      //
+      // A boundary can go missing for reasons the transcriber cannot see: pyannote relabelling,
+      // a smoothing pass that erases the transition after the matching close already fired, or
+      // simply a window whose speech never dips to silence. None of those should be able to end
+      // transcription, so open a turn at the high-water mark and let the normal machinery take
+      // over. Fires at most once per stall, since the guard is on t.turn being absent. If the
+      // span turns out to be silence the RMS gate in submitTurn drops it and TURN_MAX_MS rolls
+      // the turn, so this cannot run away.
+      if (!t.turn) {
+        // firstAudioMs is the floor, not 0: before anything has been processed both marks are
+        // still 0, and reaching back to 0 means reaching back to the epoch — the log line read
+        // "1787590604608ms of audio with no open turn" and the turn was opened 56 years before
+        // the meeting.
+        const from = Math.max(t.confirmedHighWaterMs, t.lastAudioEndMs, t.firstAudioMs ?? 0);
+        if (t.latestAudioMs - from >= SUBMIT_TICK_MS) {
+          t.log(`[ChunkedTranscriber] watchdog: ${Math.round(t.latestAudioMs - from)}ms of audio with no open turn — opening one`);
+          t.queue.push({ kind: 'open', t0: from, segId: `seg_${t.segCounter++}` });
+          void t.pump();
+        }
+        return;
+      }
       // A monologue confirms on a cadence instead of waiting for a pause. Only fires while the
       // turn is genuinely growing (unconfirmed audio beyond the cut length) and has text pending,
       // so a silent open turn is not chopped into empty pieces.
