@@ -53,6 +53,10 @@ const SPEAKERS_BY_CLASS: ReadonlyArray<ReadonlyArray<number>> = [
   [2, 3],     // 6: {2,3}
 ];
 
+/** Powerset index whose speaker set is empty. Named because the pause bridge and the
+ *  undecided-close deferral both key off it. */
+const SILENCE_CLASS = 0;
+
 function gainsSpeaker(prev: ReadonlyArray<number>, cur: ReadonlyArray<number>): boolean {
   for (const s of cur) if (!prev.includes(s)) return true;
   return false;
@@ -100,6 +104,48 @@ function despeckle(arr: number[], minRun: number): number[] {
     while (j < out.length && out[j] === out[i]) j++;
     if (j - i < minRun && i > 0) { const fill = out[i - 1]; for (let k = i; k < j; k++) out[k] = fill; }
     i = j;
+  }
+  return out;
+}
+
+/** Longest SILENCE run treated as a pause INSIDE one utterance rather than the end
+ *  of a turn. Above natural breath/phrase pauses in continuous speech, below a real
+ *  end-of-utterance gap. Env-tunable because the right value is speaking-style and
+ *  language dependent, and this ships as a hotfix mount where a rebuild is expensive. */
+const PAUSE_BRIDGE_MS = Number((typeof process !== 'undefined' && process.env?.VEXA_PAUSE_BRIDGE_MS) || 600);
+const PAUSE_BRIDGE_FRAMES = Math.max(0, Math.round(PAUSE_BRIDGE_MS / MS_PER_FRAME));
+
+/** Bridge a short silence run that sits between two runs of the SAME speaker class:
+ *  that is one person breathing mid-sentence, not a turn boundary. Without this, a
+ *  ~200ms pause fires speaker->silence + silence->speaker, and because the transcriber
+ *  opens a turn only ON silence->speaker, the audio between the two is never submitted
+ *  at all — measured at 32% of a 61s German monologue, with the lost words mapping
+ *  exactly onto the gaps. It also shatters Whisper's window: every submission came out
+ *  0.5-2.0s, far too short for German compound morphology ("Emissionshandel" split
+ *  across two windows into "Emissionsmarkt" + "Emissionshandel").
+ *
+ *  Deliberately ASYMMETRIC, unlike despeckle: only a silence run BRACKETED BY THE SAME
+ *  speaker is filled. A short SPEECH run between silences ("Ja.") is left alone, so a
+ *  brief real utterance is never swallowed — this removes false-positive cuts without
+ *  adding false negatives. Different classes either side (A -> silence -> B) is a real
+ *  handoff and stays a cut. */
+function bridgePauses(arr: number[], maxRunFrames: number): number[] {
+  if (maxRunFrames <= 0) return arr;
+  const out = arr.slice();
+  const runs: Array<{ from: number; to: number; cls: number }> = [];
+  for (let i = 0; i < out.length; ) {
+    let j = i;
+    while (j < out.length && out[j] === out[i]) j++;
+    runs.push({ from: i, to: j, cls: out[i] });
+    i = j;
+  }
+  for (let r = 1; r < runs.length - 1; r++) {
+    const run = runs[r];
+    if (run.cls !== SILENCE_CLASS) continue;
+    if (run.to - run.from > maxRunFrames) continue;
+    const before = runs[r - 1].cls;
+    if (before === SILENCE_CLASS || before !== runs[r + 1].cls) continue;
+    for (let k = run.from; k < run.to; k++) out[k] = before;
   }
   return out;
 }
@@ -271,7 +317,12 @@ export class PyannoteSegmenter {
       frameClasses[f] = best;
       frameConfidence[f] = 1 / sumExp;
     }
-    const smoothed = despeckle(medianFilter3(frameClasses), MIN_RUN_FRAMES);
+    // despeckle first (kill argmax wobbles), THEN bridge phrase pauses: bridging works
+    // on settled runs, so it must not see single-frame noise as a run boundary.
+    const smoothed = bridgePauses(
+      despeckle(medianFilter3(frameClasses), MIN_RUN_FRAMES),
+      PAUSE_BRIDGE_FRAMES,
+    );
     const frameMs = (window.length / SAMPLE_RATE) * 1000 / numFrames; // ≈13.04
     // pack-msteams-diarization-cutover (#394): scan the ENTIRE window
     // every time, not just the last freshWindowSamples worth. The fresh-
@@ -317,6 +368,17 @@ export class PyannoteSegmenter {
           ? 'speaker→silence'
           : (curSet.length > prevSet.length ? 'overlap-onset'
             : (curSet.length < prevSet.length ? 'overlap-offset' : 'speaker→speaker'));
+      // A silence run that is still SHORTER than the bridge window when it reaches the
+      // end of real audio is undecided: the next inference (500ms later) may bridge it
+      // into one continuous turn, or it may grow into a genuine end-of-utterance. Emitting
+      // the close now would be unrecoverable — once bridged there is no silence->speaker
+      // left to reopen the turn — so defer and let the next full-window scan rule on it.
+      // Nothing is emitted here, so the dedup floors cannot suppress the retry.
+      if (kind === 'speaker→silence' && PAUSE_BRIDGE_FRAMES > 0) {
+        let end = f;
+        while (end < scanEnd && smoothed[end] === SILENCE_CLASS) end++;
+        if (end >= scanEnd && end - f <= PAUSE_BRIDGE_FRAMES) continue;
+      }
       const ev: BoundaryEvent = { tMs, kind, confidence: frameConfidence[f] };
       // DEBUG (oversegmentation): show speaker→speaker cuts with the smoothed-class
       // context around the cut frame — a brief flip back (e.g. 1112221 = wobble) vs
