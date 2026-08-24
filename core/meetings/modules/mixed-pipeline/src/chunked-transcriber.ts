@@ -433,7 +433,24 @@ export class ChunkedTranscriber {
     if (this.disposed) return;
     switch (ev.kind) {
       case 'silence→speaker':
-        this.openTurn(ev.tMs);
+        // An open turn is already capturing this speech, so there is nothing to open — and
+        // opening anyway is destructive, because openTurnApply force-closes whatever was
+        // open. Repeated onsets are the norm, not the exception: the scan covers the WHOLE
+        // 10s window on every inference (pack #394), so one speech onset is re-detected by
+        // every inference that still holds it, and because tMs is derived from the drifting
+        // window start it lands a little later each time and clears the 100ms dedup.
+        //
+        // Measured with the segmenter probe on a 76s reading: 32 silence→speaker against 4
+        // speaker→silence, arriving in bursts — five inside 0.7s at one onset, ten inside
+        // 1.7s at another, every one with the identical class context 00000000222222222.
+        // Each one ended the open turn, which is why continuous speech came out as 30 turns
+        // of 0.58-5.90s cut mid-word, and why Whisper then decoded both halves as whole
+        // words ("Update Agents Install." / "Update Agents Installer").
+        //
+        // The queue has to be consulted too, not just this.turn: opens and closes are
+        // applied asynchronously under the pump lock, so a burst can arrive entirely before
+        // the first of them is applied.
+        if (!this.turnOpenAfterQueue()) this.openTurn(ev.tMs);
         break;
       case 'speaker→speaker':
       case 'overlap-onset':
@@ -445,6 +462,18 @@ export class ChunkedTranscriber {
         this.closeTurn(ev.tMs, SILENCE_CLOSE_CONTEXT_MS);
         break;
     }
+  }
+
+  /** Whether a turn will be open once the queue drains — this.turn adjusted by the
+   *  lifecycle items still pending. A boundary handler must decide against this, not
+   *  against this.turn, because the pump applies items asynchronously. */
+  private turnOpenAfterQueue(): boolean {
+    let open = this.turn !== null;
+    for (const item of this.queue) {
+      if (item === 'tick') continue;
+      open = item.kind === 'open';
+    }
+    return open;
   }
 
   private openTurn(t0: number): void {
