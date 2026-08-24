@@ -288,7 +288,28 @@ export class ChunkedTranscriber {
       // Liveness: an item enqueued during the pump's closing pass misses the
       // drain loop; with no further boundaries nothing would re-pump it.
       if (t.queue.length > 0) { void t.pump(); return; }
-      if (!t.turn) return;
+      // WATCHDOG: audio is arriving but no turn is open. Every other branch below is
+      // guarded on t.turn, and the ONLY thing that opens one is a silence->speaker
+      // boundary from the segmenter — so a single missed reopen silences the meeting
+      // permanently, with no error and audio still flowing. Measured: a meeting made 6
+      // STT calls in 67s of continuous speech and then went quiet for the remaining 50s.
+      //
+      // A boundary can go missing for reasons the transcriber cannot see: pyannote
+      // relabelling, a smoothing pass that erases the transition after the matching close
+      // already fired, or simply a window whose speech never dips to silence. None of
+      // those should be able to end transcription, so open a turn at the high-water mark
+      // and let the normal machinery take over. Fires at most once per stall, since the
+      // guard is on t.turn being absent. If the span turns out to be silence the RMS gate
+      // in submitTurn drops it and TURN_MAX_MS rolls the turn, so this cannot run away.
+      if (!t.turn) {
+        const from = Math.max(t.confirmedHighWaterMs, t.lastAudioEndMs);
+        if (t.latestAudioMs - from >= SUBMIT_TICK_MS) {
+          t.log(`[ChunkedTranscriber] watchdog: ${Math.round(t.latestAudioMs - from)}ms of audio with no open turn — opening one`);
+          t.queue.push({ kind: 'open', t0: from, segId: `seg_${t.segCounter++}` });
+          void t.pump();
+        }
+        return;
+      }
       if (t.latestAudioMs - t.turn.confirmedUpToMs > TURN_MAX_MS) {
         t.queue.push({ kind: 'close', t1: t.latestAudioMs });
         t.queue.push({ kind: 'open', t0: t.latestAudioMs, segId: `seg_${t.segCounter++}` });
