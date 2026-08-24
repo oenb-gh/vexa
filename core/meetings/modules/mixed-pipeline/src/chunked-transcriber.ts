@@ -90,6 +90,10 @@ const CONFIRM_TTL_MS = 2500;
 /** Don't bother Whisper with unconfirmed windows shorter than this unless
  *  the turn is closing. */
 const MIN_SUBMIT_MS = 800;
+/** Longest gap a new turn back-extends over to pick up audio the previous close left
+ *  behind. Bounded so a genuine break (a long silence, a bot idling between agenda
+ *  items) is not dragged into the next window as minutes of nothing. */
+const GAP_RECOVERY_MAX_MS = 5000;
 /** Time-based resubmission cadence for the OPEN turn (the bot's
  *  submitInterval): pending refreshes and LocalAgreement stability build at
  *  this pace instead of waiting for the next boundary (which can be 10s away
@@ -511,11 +515,30 @@ export class ChunkedTranscriber {
   private async openTurnApply(item: { t0: number; segId: string }): Promise<void> {
     this.commitCounter++;
     if (this.turn) { const prev = this.turn; this.turn = null; await this.submitTurn(prev, true); }
-    const t0 = Math.max(item.t0, this.confirmedHighWaterMs);
+    // Where speech actually starts, per the segmenter — the prompt-reset decision below
+    // is about the acoustic gap, so it must read this and NOT the back-extended cut start.
+    const speechStartMs = Math.max(item.t0, this.confirmedHighWaterMs);
     // Real silence since the last turn → reset the in-memory prompt so the new
     // utterance starts clean (no inherited context, no silence-hallucination loop).
-    if (this.lastAudioEndMs > 0 && t0 - this.lastAudioEndMs >= SILENCE_PROMPT_RESET_MS) {
+    if (this.lastAudioEndMs > 0 && speechStartMs - this.lastAudioEndMs >= SILENCE_PROMPT_RESET_MS) {
       this.lastConfirmedText = '';
+    }
+    // Gap recovery. closeOut advances confirmedHighWaterMs to the closing turn's t1, so
+    // audio between that t1 and this boundary belongs to NO turn and is never submitted
+    // — permanently, since the high-water mark also blocks any later commit from reaching
+    // back. Pyannote's speech-start frame runs late and its speech-end frame runs early,
+    // so on continuous speech that hole is systematic: 19.4s of a measured 61.2s meeting,
+    // and the words that went missing from the transcript sat exactly inside it.
+    //
+    // Back-extend the cut to where the last turn ended, which is exactly what the
+    // high-water clamp already permits (never into confirmed audio, so no double
+    // transcription). The RMS gate in submitTurn still drops a span that turns out to be
+    // silence, and Whisper handles a short silent prefix fine.
+    let t0 = speechStartMs;
+    const gapMs = t0 - this.confirmedHighWaterMs;
+    if (this.confirmedHighWaterMs > 0 && gapMs > 0 && gapMs <= GAP_RECOVERY_MAX_MS) {
+      this.log(`[ChunkedTranscriber] turn back-extended ${Math.round(gapMs)}ms to recover the inter-turn gap`);
+      t0 = this.confirmedHighWaterMs;
     }
     this.turn = {
       clusterId: item.segId, turnId: this.turnCounter++,
