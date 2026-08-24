@@ -303,7 +303,11 @@ async def list_models():
 async def transcribe_audio(
     request: Request,
     file: UploadFile = File(...),
-    requested_model: str = Form(..., alias="model"),
+    # Optional on purpose. The OpenAI spec makes `model` required, but this unit ignores
+    # its VALUE (the model that runs is MODEL_SIZE), so rejecting a request that omits it
+    # buys nothing and locks out lenient clients — including in-house services that were
+    # written against a backend which never asked for it.
+    requested_model: Optional[str] = Form(None, alias="model"),
     temperature: str = Form("0"),
     language: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
@@ -327,8 +331,6 @@ async def transcribe_audio(
     - Limits concurrent transcriptions to prevent GPU/CPU overload
     - Returns 429/503 when queue is full to signal backpressure
     """
-    if not requested_model:
-        raise HTTPException(status_code=400, detail="Model parameter is required")
     global waiting_requests, active_realtime_requests, active_deferred_requests
 
     tier_from_header = request.headers.get("X-Transcription-Tier")
