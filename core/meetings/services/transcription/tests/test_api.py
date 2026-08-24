@@ -27,3 +27,16 @@ def test_transcribe_rejects_missing_file(client, monkeypatch):
     monkeypatch.setattr(svc, "API_TOKEN", "")
     r = client.post("/v1/audio/transcriptions", data={"model": "large-v3-turbo"})
     assert r.status_code == 422
+
+
+def test_lists_the_one_model_it_serves(client, monkeypatch):
+    """GET /v1/models — discovery clients and gateways list a provider before using it."""
+    import transcription.main as svc
+
+    monkeypatch.setattr(svc, "MODEL_ID", "large-v3-turbo")
+    r = client.get("/v1/models")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["object"] == "list"
+    assert [m["id"] for m in body["data"]] == ["large-v3-turbo"]
+    assert body["data"][0]["owned_by"] == "faster-whisper"

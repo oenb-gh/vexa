@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 WORKER_ID = os.getenv("WORKER_ID", "1")
 MODEL_SIZE = os.getenv("MODEL_SIZE", "large-v3-turbo")
 
+# The id this unit ADVERTISES on GET /v1/models. Defaults to the model it actually runs.
+# A deployment fronted by a gateway that validates model ids (LiteLLM, an API portal)
+# has to advertise the name the gateway routes on, which need not be a whisper size —
+# the same reason the main stack carries TRANSCRIPTION_MODEL. The transcription endpoint
+# still ignores the requested id: the model that runs is always MODEL_SIZE.
+MODEL_ID = os.getenv("MODEL_ID", "").strip() or MODEL_SIZE
+
+# Advertised as the model's creation time. Process start is the only honest value here:
+# weights are pulled lazily, so there is nothing older to report.
+SERVICE_STARTED = int(time.time())
+
 # Device detection: Use environment variable or default to cuda for GPU containers
 # CTranslate2 (used by faster-whisper) will automatically detect and use CUDA if available
 DEVICE = os.getenv("DEVICE", "cuda")
@@ -265,6 +276,27 @@ async def health_check():
         return JSONResponse(content=health_status, status_code=503)
     
     return health_status
+
+
+@app.get("/v1/models")
+async def list_models():
+    """OpenAI-compatible model list.
+
+    One entry, because this unit serves exactly one model. Clients that discover models
+    before transcribing (and gateways that health-check a provider by listing it) get a
+    404 without this, even though transcription works — so the unit looks unregistered.
+    """
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": MODEL_ID,
+                "object": "model",
+                "created": SERVICE_STARTED,
+                "owned_by": "faster-whisper",
+            }
+        ],
+    }
 
 
 @app.post("/v1/audio/transcriptions")
