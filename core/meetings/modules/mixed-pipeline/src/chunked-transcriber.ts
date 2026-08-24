@@ -302,7 +302,11 @@ export class ChunkedTranscriber {
       // guard is on t.turn being absent. If the span turns out to be silence the RMS gate
       // in submitTurn drops it and TURN_MAX_MS rolls the turn, so this cannot run away.
       if (!t.turn) {
-        const from = Math.max(t.confirmedHighWaterMs, t.lastAudioEndMs);
+        // firstAudioMs is the floor, not 0: before anything has been processed both marks
+        // are still 0, and reaching back to 0 means reaching back to the epoch — the log
+        // line read "1787590604608ms of audio with no open turn" and the turn was opened
+        // 56 years before the meeting.
+        const from = Math.max(t.confirmedHighWaterMs, t.lastAudioEndMs, t.firstAudioMs ?? 0);
         if (t.latestAudioMs - from >= SUBMIT_TICK_MS) {
           t.log(`[ChunkedTranscriber] watchdog: ${Math.round(t.latestAudioMs - from)}ms of audio with no open turn — opening one`);
           t.queue.push({ kind: 'open', t0: from, segId: `seg_${t.segCounter++}` });
