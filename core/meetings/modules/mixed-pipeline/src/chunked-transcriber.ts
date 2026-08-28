@@ -666,7 +666,34 @@ export class ChunkedTranscriber {
   private sourceCallbacks(kind: 'pyannote' | 'csrc'): TurnSourceCallbacks {
     const mine = (): boolean => !this.disposed && this.authoritative === kind;
     return {
-      turnOpened: (ev) => { if (mine()) this.openTurn(ev.t0, ev.trackId, ev.contested); },
+      turnOpened: (ev) => {
+        if (!mine()) return;
+        // PYANNOTE ONLY: an open turn is already capturing this speech, so a second open is
+        // meaningless — and destructive, because openTurnApply force-closes whatever was open.
+        // Repeated onsets are the norm on this spine, not the exception: the segmenter's scan
+        // covers the WHOLE 10s window on every inference (pack #394), so one speech onset is
+        // re-detected by every inference that still holds it, and because tMs derives from the
+        // drifting window start it lands a little later each time and clears the 100ms dedup.
+        //
+        // Measured with the segmenter probe on a 76s reading: 32 silence→speaker against 4
+        // speaker→silence, arriving in bursts — five inside 0.7s at one onset, ten inside 1.7s
+        // at another, every one with the identical class context 00000000222222222. There were
+        // ZERO speaker→speaker and ZERO overlap events. Each re-emission ended the open turn,
+        // which is why continuous speech came out as 30 turns of 0.58–5.90s cut mid-word, and
+        // why Whisper then decoded both halves as whole words ("Update Agents Install." /
+        // "Update Agents Installer").
+        //
+        // Not applied to the transport spine: there an open is an OBSERVED transition carrying a
+        // trackId, so it is never a re-emission of one the lane already has. speaker→speaker and
+        // the overlap kinds are unaffected either way — PyannoteTurnSource emits turnClosed
+        // before turnOpened for those, and there the split is the point.
+        //
+        // The queue has to be consulted as well as this.turn: lifecycle items are applied
+        // asynchronously under the pump lock, so a whole burst can land before the first of them
+        // is applied.
+        if (kind === 'pyannote' && this.turnOpenAfterQueue()) return;
+        this.openTurn(ev.t0, ev.trackId, ev.contested);
+      },
       turnGrown: (ev) => {
         if (!mine() || !this.turn) return;
         if (this.turn.trackId !== ev.trackId) return;
@@ -681,6 +708,18 @@ export class ChunkedTranscriber {
         this.closeTurn(ev.t1, ev.reason === 'silence' ? SILENCE_CLOSE_CONTEXT_MS : 0);
       },
     };
+  }
+
+  /** Whether a turn will be open once the queue drains — this.turn adjusted by the lifecycle
+   *  items still pending. A boundary handler must decide against this, not against this.turn,
+   *  because the pump applies items asynchronously. */
+  private turnOpenAfterQueue(): boolean {
+    let open = this.turn !== null;
+    for (const item of this.queue) {
+      if (item === 'tick') continue;
+      open = item.kind === 'open';
+    }
+    return open;
   }
 
   /** A close+reopen that is a WINDOW bound rather than a speaker change: the successor inherits
