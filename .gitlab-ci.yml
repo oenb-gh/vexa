@@ -136,6 +136,15 @@ build:
 # Result: oenb-dev/<image>:<CI_COMMIT_SHA>, pinnable from vexa-k8s the same way as a main build.
 deploy:
   rules:
+    # A Docker tag cannot contain `/`, and the template pushes
+    # oenb-intern/<image>:$CI_COMMIT_TAG verbatim — so a provenance tag such as
+    # `archive/upstream-pr-series-v0.12.18` dies with `Error: invalid reference format`
+    # AFTER a full image build has already run (measured: pipeline #8594, exit 125).
+    # Only release tags are meant to publish, and every release tag here is `v<digit>…`.
+    # Kept as an explicit `never` rather than narrowing the rule below, so the next reader
+    # sees that non-release tags are a decision and not an oversight.
+    - if: '$CI_COMMIT_TAG && $CI_COMMIT_TAG !~ /^v[0-9]/'
+      when: never
     - if: '$CI_COMMIT_TAG'                            # → oenb-intern/<image>:<tag>
       when: on_success
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'   # → oenb-dev/<image>:<sha> + :latest
